@@ -25,8 +25,7 @@ pub struct Player {
 }
 
 pub struct Game {
-    // width/height removidos, no se usan
-    mode: Mode, // ya no es pub para evitar la advertencia de visibilidad
+    mode: Mode,
     pub level_index: usize,
     pub level: Level,
     pub player: Player,
@@ -295,13 +294,17 @@ impl Game {
     }
 
     fn check_collisions_and_pickups(&mut self) {
+        // Reducimos el radio de recolección para coincidir con pellets más pequeños
+        let pickup_r = 0.18f32; // antes 0.25
+        let pickup_r2 = pickup_r * pickup_r;
+
         let mut collected_indices = Vec::new();
         for (i, s) in self.sprites.iter().enumerate() {
             if s.kind == SpriteKind::Pellet {
                 let dx = self.player.x - s.x;
                 let dy = self.player.y - s.y;
                 let dist2 = dx * dx + dy * dy;
-                if dist2 < 0.25 * 0.25 {
+                if dist2 < pickup_r2 {
                     collected_indices.push(i);
                 }
             }
@@ -374,6 +377,7 @@ impl Game {
 
         rect_fill(frame, w, h, origin_x - 2, origin_y - 2, map_w + 4, map_h + 4, [0, 0, 0, 180]);
 
+        // Mapa
         for y in 0..self.level.h {
             for x in 0..self.level.w {
                 let tile = self.level.tile(x, y);
@@ -395,6 +399,18 @@ impl Game {
             }
         }
 
+        // Pelotas opcional: no las dibujamos para no saturar, pedido fue ver fantasmas
+
+        // Fantasmas en el minimapa (puntos rojos/rosados)
+        for s in &self.sprites {
+            if s.kind == SpriteKind::Ghost {
+                let gx = origin_x as f32 + s.x * scale as f32;
+                let gy = origin_y as f32 + s.y * scale as f32;
+                rect_fill(frame, w, h, gx as i32 - 1, gy as i32 - 1, 3, 3, [255, 80, 80, 255]);
+            }
+        }
+
+        // Jugador
         let px = origin_x as f32 + self.player.x * scale as f32;
         let py = origin_y as f32 + self.player.y * scale as f32;
         rect_fill(frame, w, h, px as i32 - 2, py as i32 - 2, 4, 4, [255, 255, 0, 255]);
