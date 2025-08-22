@@ -11,6 +11,7 @@ enum Mode {
     Menu,
     Playing,
     Win,
+    GameOver,
 }
 
 pub struct Player {
@@ -38,6 +39,12 @@ pub struct Game {
     pub pellets_remaining: usize,
     pub depth: DepthBuffer,
     mouse_sensitivity: f32,
+
+    // Nuevos campos
+    pub lives: i32,           // vidas restantes en el nivel actual (3 por nivel)
+    invincible_time: f32,     // tiempo de invulnerabilidad tras perder vida
+    time: f32,                // tiempo global (para IA de fantasmas)
+    death_anim_t: f32,        // progreso de animación de Game Over
 }
 
 impl Game {
@@ -75,6 +82,11 @@ impl Game {
             pellets_remaining,
             depth: DepthBuffer::new(width as usize),
             mouse_sensitivity: 0.0035,
+
+            lives: 3,
+            invincible_time: 0.0,
+            time: 0.0,
+            death_anim_t: 0.0,
         })
     }
 
@@ -128,6 +140,21 @@ impl Game {
                     self.mode = Mode::Menu;
                 }
             }
+            Mode::GameOver => {
+                if pressed {
+                    match key {
+                        VirtualKeyCode::R => {
+                            // Reintentar este nivel
+                            self.start_level(self.level_index);
+                        }
+                        VirtualKeyCode::Return => {
+                            // Volver al menú
+                            self.mode = Mode::Menu;
+                        }
+                        _ => {}
+                    }
+                }
+            }
             Mode::Playing => {}
         }
     }
@@ -153,6 +180,11 @@ impl Game {
         self.sprites = Self::build_sprites_for_level(&self.level);
         self.pellets_remaining = self.sprites.iter().filter(|s| s.kind == SpriteKind::Pellet).count();
         self.mode = Mode::Playing;
+        self.lives = 3;                // 3 vidas por nivel
+        self.invincible_time = 0.0;    // sin invulnerabilidad al inicio
+        self.death_anim_t = 0.0;
+        self.time = 0.0;
+
         self.audio.play_music_loop("assets/music/theme.ogg");
     }
 
@@ -168,10 +200,20 @@ impl Game {
         match self.mode {
             Mode::Menu => {}
             Mode::Win => {}
+            Mode::GameOver => {
+                // Animación de Game Over
+                self.death_anim_t += dt;
+            }
             Mode::Playing => {
+                self.time += dt;
+                if self.invincible_time > 0.0 {
+                    self.invincible_time = (self.invincible_time - dt).max(0.0);
+                }
+
                 self.handle_input(dt);
                 self.update_sprites(dt);
                 self.check_collisions_and_pickups();
+
                 if self.pellets_remaining == 0 {
                     self.mode = Mode::Win;
                     self.audio.play_sfx("assets/sfx/win.wav");
@@ -251,52 +293,107 @@ impl Game {
     }
 
     fn update_sprites(&mut self, dt: f32) {
-        let level = &self.level;
-        let sprites = &mut self.sprites;
+        // 1) Animación de pellets
+        for s in self.sprites.iter_mut() {
+            if s.kind == SpriteKind::Pellet {
+                s.anim_time += dt;
+                if s.anim_time > 0.5 {
+                    s.anim_time = 0.0;
+                    s.anim_frame = (s.anim_frame + 1) % 2;
+                }
+            }
+        }
+
+        // 2) IA de fantasmas con dispersión y separación (no todos juntos)
+        // Snapshot de posiciones de fantasmas para calcular fuerzas sin conflictos de préstamos
+        let ghost_positions: Vec<(usize, f32, f32)> = self
+            .sprites
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                if s.kind == SpriteKind::Ghost {
+                    Some((i, s.x, s.y))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Parámetros de comportamiento
+        let scatter_r = 1.6_f32; // radio del offset alrededor del jugador
+        let sep_r = 0.9_f32;     // radio de separación entre fantasmas
+        let speed = 1.35_f32;    // velocidad base
         let mut rng = rand::thread_rng();
 
-        for s in sprites.iter_mut() {
-            match s.kind {
-                SpriteKind::Pellet => {
-                    s.anim_time += dt;
-                    if s.anim_time > 0.5 {
-                        s.anim_time = 0.0;
-                        s.anim_frame = (s.anim_frame + 1) % 2;
-                    }
+        for (k, (gi, gx, gy)) in ghost_positions.iter().enumerate() {
+            // Animación simple de cambio de frame
+            if let Some(gs) = self.sprites.get_mut(*gi) {
+                gs.anim_time += dt;
+                if gs.anim_time > 0.3 {
+                    gs.anim_time = 0.0;
+                    gs.anim_frame = (gs.anim_frame + 1) % 2;
                 }
-                SpriteKind::Ghost => {
-                    s.anim_time += dt;
-                    if s.anim_time > 0.3 {
-                        s.anim_time = 0.0;
-                        s.anim_frame = (s.anim_frame + 1) % 2;
-                    }
+            }
 
-                    let dir_to_player_x = self.player.x - s.x;
-                    let dir_to_player_y = self.player.y - s.y;
-                    let mut vx = dir_to_player_x * 0.5 + rng.gen_range(-0.5..0.5);
-                    let mut vy = dir_to_player_y * 0.5 + rng.gen_range(-0.5..0.5);
-                    let len = (vx * vx + vy * vy).sqrt().max(1e-4);
-                    vx /= len;
-                    vy /= len;
-                    let speed = 1.2;
-                    let nx = s.x + vx * speed * dt;
-                    let ny = s.y + vy * speed * dt;
+            // Objetivo "desplazado" alrededor del jugador para repartirlos
+            let angle = self.time * 0.6 + (k as f32) * 1.2566371; // 2π/5 ~ 1.2566
+            let target_x = self.player.x + angle.cos() * scatter_r;
+            let target_y = self.player.y + angle.sin() * scatter_r;
 
-                    if !is_wall_level(level, nx, s.y) {
-                        s.x = nx;
-                    }
-                    if !is_wall_level(level, s.x, ny) {
-                        s.y = ny;
-                    }
+            // Vector de persecución hacia objetivo desplazado
+            let mut vx = target_x - gx;
+            let mut vy = target_y - gy;
+            let mut len = (vx * vx + vy * vy).sqrt().max(1e-4);
+            vx /= len;
+            vy /= len;
+
+            // Separación de otros fantasmas (repulsión si están cerca)
+            let mut repx = 0.0;
+            let mut repy = 0.0;
+            for (j, (_oj_i, ox, oy)) in ghost_positions.iter().enumerate() {
+                if j == k {
+                    continue;
+                }
+                let dx = gx - ox;
+                let dy = gy - oy;
+                let d2 = dx * dx + dy * dy;
+                if d2 < sep_r * sep_r {
+                    let d = d2.sqrt().max(1e-3);
+                    let force = (sep_r - d) / sep_r; // 0..1
+                    repx += dx / d * force;
+                    repy += dy / d * force;
+                }
+            }
+
+            // Pequeño jitter aleatorio para que no sean idénticos
+            let jx = rng.gen_range(-0.2..0.2);
+            let jy = rng.gen_range(-0.2..0.2);
+
+            // Combina dirección (normaliza)
+            let mut fx = vx + 1.2 * repx + jx;
+            let mut fy = vy + 1.2 * repy + jy;
+            len = (fx * fx + fy * fy).sqrt().max(1e-4);
+            fx /= len;
+            fy /= len;
+
+            // Integración y colisiones
+            let nx = gx + fx * speed * dt;
+            let ny = gy + fy * speed * dt;
+
+            if let Some(gs) = self.sprites.get_mut(*gi) {
+                if !is_wall_level(&self.level, nx, gs.y) {
+                    gs.x = nx;
+                }
+                if !is_wall_level(&self.level, gs.x, ny) {
+                    gs.y = ny;
                 }
             }
         }
     }
 
     fn check_collisions_and_pickups(&mut self) {
-        // Reducimos el radio de recolección para coincidir con pellets más pequeños
-        let pickup_r = 0.18f32; // antes 0.25
-        let pickup_r2 = pickup_r * pickup_r;
+        // 1) Recolección de pellets (pellets pequeños -> radio reducido)
+        let pickup_r2 = 0.18f32 * 0.18f32;
 
         let mut collected_indices = Vec::new();
         for (i, s) in self.sprites.iter().enumerate() {
@@ -324,6 +421,43 @@ impl Game {
                 self.audio.play_sfx("assets/sfx/pellet.wav");
             }
         }
+
+        // 2) Colisión con fantasmas -> pierde vida
+        if self.invincible_time <= 0.0 && self.mode == Mode::Playing {
+            // Radio de contacto jugador-fantasma
+            let hit_r2 = 0.30f32 * 0.30f32;
+            let mut hit = false;
+
+            for s in self.sprites.iter() {
+                if s.kind == SpriteKind::Ghost {
+                    let dx = self.player.x - s.x;
+                    let dy = self.player.y - s.y;
+                    let d2 = dx * dx + dy * dy;
+                    if d2 < hit_r2 {
+                        hit = true;
+                        break;
+                    }
+                }
+            }
+
+            if hit {
+                self.lives -= 1;
+                self.audio.play_sfx("assets/sfx/hit.wav");
+
+                if self.lives > 0 {
+                    // Respawn con invulnerabilidad
+                    let (px, py) = self.level.spawn;
+                    self.player.x = px as f32 + 0.5;
+                    self.player.y = py as f32 + 0.5;
+                    self.invincible_time = 2.0;
+                } else {
+                    // Game Over
+                    self.mode = Mode::GameOver;
+                    self.death_anim_t = 0.0;
+                    self.audio.play_sfx("assets/sfx/game_over.wav");
+                }
+            }
+        }
     }
 
     fn is_down(&self, key: VirtualKeyCode) -> bool {
@@ -335,6 +469,7 @@ impl Game {
             Mode::Menu => self.render_menu(frame, w, h),
             Mode::Playing => self.render_game(frame, w, h),
             Mode::Win => self.render_win(frame, w, h),
+            Mode::GameOver => self.render_game_over(frame, w, h),
         }
     }
 
@@ -357,13 +492,43 @@ impl Game {
     fn render_game(&mut self, frame: &mut [u8], w: i32, h: i32) {
         render_scene(frame, w, h, &self.level, &self.player, &self.sprites, &mut self.depth);
 
+        // HUD
         let fps_txt = format!("FPS: {:.0}", self.fps);
         draw_text_small(frame, w, h, 6, 6, &fps_txt, [255, 255, 255, 255]);
 
         let pellets_txt = format!("Pellets: {}", self.pellets_remaining);
         draw_text_small(frame, w, h, 6, 20, &pellets_txt, [255, 255, 0, 255]);
 
+        // Vidas
+        let lives_txt = format!("Vidas: {}", self.lives.max(0));
+        draw_text_small(frame, w, h, 6, 34, &lives_txt, [255, 100, 100, 255]);
+        // Dibuja “corazones” simples como cuadros rojos
+        for i in 0..self.lives.max(0) {
+            rect_fill(frame, w, h, 70 + i * 8, 34, 6, 6, [220, 40, 40, 255]);
+        }
+
+        // Efecto visual de invulnerabilidad (flash sutil)
+        if self.invincible_time > 0.0 {
+            let a = ((self.invincible_time * 10.0).sin().abs() * 60.0) as u8;
+            rect_fill(frame, w, h, 0, 0, w, h, [255, 255, 255, a]);
+        }
+
+        // Minimap
         self.render_minimap(frame, w, h);
+    }
+
+    fn render_game_over(&mut self, frame: &mut [u8], w: i32, h: i32) {
+        // Mostrar el último frame del juego debajo (opcional), o pantalla negra/roja
+        fill(frame, w, h, 10, 0, 0);
+
+        // Fade-in negro con tiempo
+        let t = self.death_anim_t.min(2.0) / 2.0; // 0..1 en 2 segundos
+        let alpha = (t * 220.0) as u8;
+        rect_fill(frame, w, h, 0, 0, w, h, [0, 0, 0, alpha]);
+
+        draw_text_small(frame, w, h, 16, 16, "GAME OVER", [255, 255, 255, 255]);
+        draw_text_small(frame, w, h, 16, 40, "Presiona R para reintentar", [200, 200, 200, 255]);
+        draw_text_small(frame, w, h, 16, 55, "Presiona Enter para menu", [200, 200, 200, 255]);
     }
 
     fn render_minimap(&self, frame: &mut [u8], w: i32, h: i32) {
@@ -377,7 +542,6 @@ impl Game {
 
         rect_fill(frame, w, h, origin_x - 2, origin_y - 2, map_w + 4, map_h + 4, [0, 0, 0, 180]);
 
-        // Mapa
         for y in 0..self.level.h {
             for x in 0..self.level.w {
                 let tile = self.level.tile(x, y);
@@ -399,9 +563,7 @@ impl Game {
             }
         }
 
-        // Pelotas opcional: no las dibujamos para no saturar, pedido fue ver fantasmas
-
-        // Fantasmas en el minimapa (puntos rojos/rosados)
+        // Fantasmas en el minimapa
         for s in &self.sprites {
             if s.kind == SpriteKind::Ghost {
                 let gx = origin_x as f32 + s.x * scale as f32;
