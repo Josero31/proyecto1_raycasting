@@ -1,8 +1,11 @@
 [package]
 name = "proyecto1_raycasting"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-instant = "0.1.13"
-minifb = "0.28.0"
+anyhow = "1.0"
+rand = "0.8"
+winit = "0.28"
+pixels = "0.13"
+rodio = "0.17"
