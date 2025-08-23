@@ -46,6 +46,9 @@ pub struct Game {
     invincible_time: f32,  // invulnerabilidad tras perder vida
     time: f32,             // tiempo global (IA)
     death_anim_t: f32,     // animación de game over
+
+    // Contador total de monedas del nivel
+    pub total_pellets: usize,
 }
 
 impl Game {
@@ -67,7 +70,8 @@ impl Game {
 
         let audio = AudioManager::new();
         let sprites = Self::build_sprites_for_level(&level);
-        let pellets_remaining = sprites.iter().filter(|s| s.kind == SpriteKind::Pellet).count();
+        let total_pellets = sprites.iter().filter(|s| s.kind == SpriteKind::Pellet).count();
+        let pellets_remaining = total_pellets;
 
         Ok(Self {
             mode: Mode::Menu,
@@ -88,6 +92,8 @@ impl Game {
             invincible_time: 0.0,
             time: 0.0,
             death_anim_t: 0.0,
+
+            total_pellets,
         })
     }
 
@@ -216,7 +222,11 @@ impl Game {
         self.player.plane_x = 0.0;
         self.player.plane_y = 0.66;
         self.sprites = Self::build_sprites_for_level(&self.level);
-        self.pellets_remaining = self.sprites.iter().filter(|s| s.kind == SpriteKind::Pellet).count();
+
+        // Recalcular contadores de monedas
+        self.total_pellets = self.sprites.iter().filter(|s| s.kind == SpriteKind::Pellet).count();
+        self.pellets_remaining = self.total_pellets;
+
         self.mode = Mode::Playing;
         self.lives = 3;             // 3 vidas por nivel
         self.invincible_time = 0.0; // sin invulnerabilidad al inicio
@@ -244,7 +254,6 @@ impl Game {
             }
             Mode::Paused => {
                 // En pausa no actualizamos lógica ni temporizadores de juego.
-                // Solo dejamos que el render dibuje el overlay.
             }
             Mode::Playing => {
                 self.time += dt;
@@ -548,14 +557,19 @@ impl Game {
         let fps_txt = format!("FPS: {:.0}", self.fps);
         draw_text_small(frame, w, h, 6, 6, &fps_txt, [255, 255, 255, 255]);
 
-        let pellets_txt = format!("Pellets: {}", self.pellets_remaining);
-        draw_text_small(frame, w, h, 6, 20, &pellets_txt, [255, 255, 0, 255]);
+        // Monedas (recogidas / total) y faltantes
+        let collected = self.total_pellets.saturating_sub(self.pellets_remaining);
+        let coins_txt = format!("Monedas: {}/{}", collected, self.total_pellets);
+        draw_text_small(frame, w, h, 6, 20, &coins_txt, [255, 230, 0, 255]);
+
+        let left_txt = format!("Faltan: {}", self.pellets_remaining);
+        draw_text_small(frame, w, h, 6, 34, &left_txt, [200, 200, 200, 255]);
 
         // Vidas
         let lives_txt = format!("Vidas: {}", self.lives.max(0));
-        draw_text_small(frame, w, h, 6, 34, &lives_txt, [255, 100, 100, 255]);
+        draw_text_small(frame, w, h, 6, 50, &lives_txt, [255, 100, 100, 255]);
         for i in 0..self.lives.max(0) {
-            rect_fill(frame, w, h, 70 + i * 8, 34, 6, 6, [220, 40, 40, 255]);
+            rect_fill(frame, w, h, 70 + i * 8, 50, 6, 6, [220, 40, 40, 255]);
         }
 
         // Efecto de invulnerabilidad (flash sutil)
