@@ -10,6 +10,7 @@ use winit::event::VirtualKeyCode;
 enum Mode {
     Menu,
     Playing,
+    Paused,
     Win,
     GameOver,
 }
@@ -40,11 +41,11 @@ pub struct Game {
     pub depth: DepthBuffer,
     mouse_sensitivity: f32,
 
-    // Nuevos campos
-    pub lives: i32,           // vidas restantes en el nivel actual (3 por nivel)
-    invincible_time: f32,     // tiempo de invulnerabilidad tras perder vida
-    time: f32,                // tiempo global (para IA de fantasmas)
-    death_anim_t: f32,        // progreso de animación de Game Over
+    // Vidas y estado
+    pub lives: i32,        // 3 vidas por nivel
+    invincible_time: f32,  // invulnerabilidad tras perder vida
+    time: f32,             // tiempo global (IA)
+    death_anim_t: f32,     // animación de game over
 }
 
 impl Game {
@@ -90,20 +91,36 @@ impl Game {
         })
     }
 
+    // Menos monedas: aprox 1 de cada 6 celdas vacías, determinista por coordenadas
     fn build_sprites_for_level(level: &Level) -> Vec<Sprite> {
         let mut sprites = Vec::new();
+
         for y in 0..level.h {
             for x in 0..level.w {
                 if level.map[(y * level.w + x) as usize] == 0 {
                     if (x, y) == level.spawn {
                         continue;
                     }
-                    if (x + y) % 2 == 0 {
+                    if ((x + y * 3) % 6) == 0 {
                         sprites.push(Sprite::new(x as f32 + 0.5, y as f32 + 0.5, SpriteKind::Pellet));
                     }
                 }
             }
         }
+
+        // Garantiza al menos 1 pellet por nivel
+        if !sprites.iter().any(|s| s.kind == SpriteKind::Pellet) {
+            'outer: for y in 1..level.h - 1 {
+                for x in 1..level.w - 1 {
+                    if level.map[(y * level.w + x) as usize] == 0 && (x, y) != level.spawn {
+                        sprites.push(Sprite::new(x as f32 + 0.5, y as f32 + 0.5, SpriteKind::Pellet));
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        // Fantasmas en posiciones aleatorias válidas
         let mut rng = rand::thread_rng();
         for _ in 0..level.ghost_count {
             for _tries in 0..200 {
@@ -115,6 +132,7 @@ impl Game {
                 }
             }
         }
+
         sprites
     }
 
@@ -155,7 +173,27 @@ impl Game {
                     }
                 }
             }
-            Mode::Playing => {}
+            Mode::Paused => {
+                if pressed {
+                    match key {
+                        VirtualKeyCode::P => {
+                            // Reanudar
+                            self.mode = Mode::Playing;
+                        }
+                        VirtualKeyCode::Return => {
+                            // Volver al menú desde pausa
+                            self.mode = Mode::Menu;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Mode::Playing => {
+                if pressed && key == VirtualKeyCode::P {
+                    // Pausa
+                    self.mode = Mode::Paused;
+                }
+            }
         }
     }
 
@@ -180,8 +218,8 @@ impl Game {
         self.sprites = Self::build_sprites_for_level(&self.level);
         self.pellets_remaining = self.sprites.iter().filter(|s| s.kind == SpriteKind::Pellet).count();
         self.mode = Mode::Playing;
-        self.lives = 3;                // 3 vidas por nivel
-        self.invincible_time = 0.0;    // sin invulnerabilidad al inicio
+        self.lives = 3;             // 3 vidas por nivel
+        self.invincible_time = 0.0; // sin invulnerabilidad al inicio
         self.death_anim_t = 0.0;
         self.time = 0.0;
 
@@ -204,6 +242,10 @@ impl Game {
                 // Animación de Game Over
                 self.death_anim_t += dt;
             }
+            Mode::Paused => {
+                // En pausa no actualizamos lógica ni temporizadores de juego.
+                // Solo dejamos que el render dibuje el overlay.
+            }
             Mode::Playing => {
                 self.time += dt;
                 if self.invincible_time > 0.0 {
@@ -214,6 +256,7 @@ impl Game {
                 self.update_sprites(dt);
                 self.check_collisions_and_pickups();
 
+                // Victoria al recolectar todas las monedas
                 if self.pellets_remaining == 0 {
                     self.mode = Mode::Win;
                     self.audio.play_sfx("assets/sfx/win.wav");
@@ -304,29 +347,22 @@ impl Game {
             }
         }
 
-        // 2) IA de fantasmas con dispersión y separación (no todos juntos)
-        // Snapshot de posiciones de fantasmas para calcular fuerzas sin conflictos de préstamos
+        // 2) IA de fantasmas con dispersión y separación
         let ghost_positions: Vec<(usize, f32, f32)> = self
             .sprites
             .iter()
             .enumerate()
-            .filter_map(|(i, s)| {
-                if s.kind == SpriteKind::Ghost {
-                    Some((i, s.x, s.y))
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(i, s)| if s.kind == SpriteKind::Ghost { Some((i, s.x, s.y)) } else { None })
             .collect();
 
-        // Parámetros de comportamiento
-        let scatter_r = 1.6_f32; // radio del offset alrededor del jugador
-        let sep_r = 0.9_f32;     // radio de separación entre fantasmas
-        let speed = 1.35_f32;    // velocidad base
+        let scatter_r = 1.6_f32; // offset alrededor del jugador
+        let sep_r = 0.9_f32; // separación entre fantasmas
+        let speed = 1.35_f32;
+
         let mut rng = rand::thread_rng();
 
         for (k, (gi, gx, gy)) in ghost_positions.iter().enumerate() {
-            // Animación simple de cambio de frame
+            // Animación simple del fantasma
             if let Some(gs) = self.sprites.get_mut(*gi) {
                 gs.anim_time += dt;
                 if gs.anim_time > 0.3 {
@@ -335,19 +371,19 @@ impl Game {
                 }
             }
 
-            // Objetivo "desplazado" alrededor del jugador para repartirlos
-            let angle = self.time * 0.6 + (k as f32) * 1.2566371; // 2π/5 ~ 1.2566
+            // Objetivo desplazado en círculo alrededor del jugador (diferente por fantasma)
+            let angle = self.time * 0.6 + (k as f32) * 1.2566371; // ~2π/5
             let target_x = self.player.x + angle.cos() * scatter_r;
             let target_y = self.player.y + angle.sin() * scatter_r;
 
-            // Vector de persecución hacia objetivo desplazado
+            // Dirección hacia el objetivo
             let mut vx = target_x - gx;
             let mut vy = target_y - gy;
             let mut len = (vx * vx + vy * vy).sqrt().max(1e-4);
             vx /= len;
             vy /= len;
 
-            // Separación de otros fantasmas (repulsión si están cerca)
+            // Fuerza de separación de otros fantasmas
             let mut repx = 0.0;
             let mut repy = 0.0;
             for (j, (_oj_i, ox, oy)) in ghost_positions.iter().enumerate() {
@@ -365,18 +401,18 @@ impl Game {
                 }
             }
 
-            // Pequeño jitter aleatorio para que no sean idénticos
+            // Jitter aleatorio
             let jx = rng.gen_range(-0.2..0.2);
             let jy = rng.gen_range(-0.2..0.2);
 
-            // Combina dirección (normaliza)
+            // Combinar y normalizar
             let mut fx = vx + 1.2 * repx + jx;
             let mut fy = vy + 1.2 * repy + jy;
             len = (fx * fx + fy * fy).sqrt().max(1e-4);
             fx /= len;
             fy /= len;
 
-            // Integración y colisiones
+            // Movimiento con colisiones
             let nx = gx + fx * speed * dt;
             let ny = gy + fy * speed * dt;
 
@@ -424,7 +460,6 @@ impl Game {
 
         // 2) Colisión con fantasmas -> pierde vida
         if self.invincible_time <= 0.0 && self.mode == Mode::Playing {
-            // Radio de contacto jugador-fantasma
             let hit_r2 = 0.30f32 * 0.30f32;
             let mut hit = false;
 
@@ -468,6 +503,7 @@ impl Game {
         match self.mode {
             Mode::Menu => self.render_menu(frame, w, h),
             Mode::Playing => self.render_game(frame, w, h),
+            Mode::Paused => self.render_paused(frame, w, h),
             Mode::Win => self.render_win(frame, w, h),
             Mode::GameOver => self.render_game_over(frame, w, h),
         }
@@ -480,13 +516,29 @@ impl Game {
         draw_text_small(frame, w, h, 16, 60, "[1] Nivel 1", [180, 220, 255, 255]);
         draw_text_small(frame, w, h, 16, 75, "[2] Nivel 2", [180, 220, 255, 255]);
         draw_text_small(frame, w, h, 16, 90, "[3] Nivel 3", [180, 220, 255, 255]);
-        draw_text_small(frame, w, h, 16, 120, "Controles: W/S mover, Q/E o Flechas rotar, Mouse rota", [180, 180, 180, 255]);
+        draw_text_small(
+            frame,
+            w,
+            h,
+            16,
+            120,
+            "Controles: W/S mover, Q/E o Flechas rotar, Mouse rota, P pausar",
+            [180, 180, 180, 255],
+        );
     }
 
     fn render_win(&mut self, frame: &mut [u8], w: i32, h: i32) {
         fill(frame, w, h, 0, 40, 0);
         draw_text_small(frame, w, h, 16, 16, "¡Nivel completado!", [255, 255, 255, 255]);
-        draw_text_small(frame, w, h, 16, 40, "Presiona Enter para volver al menu", [200, 200, 200, 255]);
+        draw_text_small(
+            frame,
+            w,
+            h,
+            16,
+            40,
+            "Presiona Enter para volver al menu",
+            [200, 200, 200, 255],
+        );
     }
 
     fn render_game(&mut self, frame: &mut [u8], w: i32, h: i32) {
@@ -502,12 +554,11 @@ impl Game {
         // Vidas
         let lives_txt = format!("Vidas: {}", self.lives.max(0));
         draw_text_small(frame, w, h, 6, 34, &lives_txt, [255, 100, 100, 255]);
-        // Dibuja “corazones” simples como cuadros rojos
         for i in 0..self.lives.max(0) {
             rect_fill(frame, w, h, 70 + i * 8, 34, 6, 6, [220, 40, 40, 255]);
         }
 
-        // Efecto visual de invulnerabilidad (flash sutil)
+        // Efecto de invulnerabilidad (flash sutil)
         if self.invincible_time > 0.0 {
             let a = ((self.invincible_time * 10.0).sin().abs() * 60.0) as u8;
             rect_fill(frame, w, h, 0, 0, w, h, [255, 255, 255, a]);
@@ -517,12 +568,29 @@ impl Game {
         self.render_minimap(frame, w, h);
     }
 
+    fn render_paused(&mut self, frame: &mut [u8], w: i32, h: i32) {
+        // Dibuja la escena congelada y un overlay de pausa
+        self.render_game(frame, w, h);
+        // Overlay semitransparente
+        rect_fill(frame, w, h, 0, 0, w, h, [0, 0, 0, 140]);
+        draw_text_small(frame, w, h, w / 2 - 30, h / 2 - 10, "PAUSA", [255, 255, 255, 255]);
+        draw_text_small(
+            frame,
+            w,
+            h,
+            w / 2 - 90,
+            h / 2 + 10,
+            "P: continuar   Enter: menu",
+            [220, 220, 220, 255],
+        );
+    }
+
     fn render_game_over(&mut self, frame: &mut [u8], w: i32, h: i32) {
-        // Mostrar el último frame del juego debajo (opcional), o pantalla negra/roja
+        // Fondo oscuro
         fill(frame, w, h, 10, 0, 0);
 
         // Fade-in negro con tiempo
-        let t = self.death_anim_t.min(2.0) / 2.0; // 0..1 en 2 segundos
+        let t = self.death_anim_t.min(2.0) / 2.0; // 0..1 en 2s
         let alpha = (t * 220.0) as u8;
         rect_fill(frame, w, h, 0, 0, w, h, [0, 0, 0, alpha]);
 
@@ -540,7 +608,16 @@ impl Game {
         let origin_x = w - map_w - pad;
         let origin_y = pad;
 
-        rect_fill(frame, w, h, origin_x - 2, origin_y - 2, map_w + 4, map_h + 4, [0, 0, 0, 180]);
+        rect_fill(
+            frame,
+            w,
+            h,
+            origin_x - 2,
+            origin_y - 2,
+            map_w + 4,
+            map_h + 4,
+            [0, 0, 0, 180],
+        );
 
         for y in 0..self.level.h {
             for x in 0..self.level.w {
@@ -578,7 +655,16 @@ impl Game {
         rect_fill(frame, w, h, px as i32 - 2, py as i32 - 2, 4, 4, [255, 255, 0, 255]);
         let dx = self.player.dir_x * 6.0;
         let dy = self.player.dir_y * 6.0;
-        line(frame, w, h, px as i32, py as i32, (px + dx) as i32, (py + dy) as i32, [255, 255, 255, 255]);
+        line(
+            frame,
+            w,
+            h,
+            px as i32,
+            py as i32,
+            (px + dx) as i32,
+            (py + dy) as i32,
+            [255, 255, 255, 255],
+        );
     }
 }
 
